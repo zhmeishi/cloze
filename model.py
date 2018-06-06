@@ -19,6 +19,7 @@ BOS = '<bos>'
 EOS = '<eos>'
 PAD = '<pad>'
 UNK = '<unk>'
+CONTEXT_LENGTH = 4
 
 
 def get_exp_path():
@@ -360,7 +361,7 @@ def load_pretrained_embeddings(path, params):
         params: experiment parameters
 
     Returns:
-        A `Tensor` with shape [dico_size, emb_dim]
+        A numpy array with shape [dico_size, emb_dim]
     '''
 
     logger = logging.getLogger('__main__')
@@ -409,7 +410,290 @@ def load_pretrained_embeddings(path, params):
 
     logger.info('%d tokens not found in %s' % (unfound_cnt, path))
     logger.info('Finish loading pretrained embedding')
-    return tf.convert_to_tensor(embedding, dtype=tf.float32)
+    return embedding
+
+
+class SentenceEncoder:
+    '''Sentence encoder using LSTM.'''
+
+    def __init__(self, params):
+        '''Constructor for SentenceEncoder.'''
+
+        self.params = params
+        state_dim = params.state_dim
+
+        with tf.variable_scope('SentenceEncoder'):
+            # embeddings
+            pretrained = load_pretrained_embeddings(params.pretrained, params)
+            pretrained = tf.convert_to_tensor(pretrained, tf.float32)
+            self.embeddingW = tf.get_variable(
+                'embeddingW', None, tf.float32, pretrained)
+
+            # RNN cell
+            self.rnn_cell = tf.nn.rnn_cell.BasicLSTMCell(
+                state_dim, name='word_cell')
+
+    def __call__(self, inputs):
+        '''Encode input sentence.
+
+        Args:
+            inputs: `Tensor` of shape [sample_count, sentence_count, num_steps]
+
+        Returns:
+            Sentence embedding of shape [sample_count, sentence_count, state_dim]
+        '''
+
+        state_dim = self.params.state_dim
+        num_steps = self.params.max_sentence_length
+
+        # inputs has shape [sample_count, sentence_count, num_steps]
+        sentence_count = tf.shape(inputs)[1]
+        inputs = tf.reshape(inputs, [-1, num_steps])
+        batch_size = tf.shape(inputs)[0]
+
+        # [num_steps, batch_size, emb_dim]
+        embedding = tf.nn.embedding_lookup(self.embeddingW, inputs)
+        embedding = tf.transpose(embedding, [1, 0, 2])
+
+        initial_state = self.rnn_cell.zero_state(batch_size, tf.float32)
+        _, final_state = tf.nn.dynamic_rnn(self.rnn_cell, embedding,
+            initial_state=initial_state, time_major=True)
+
+        final_state = final_state.h
+        final_state = tf.reshape(final_state, [-1, sentence_count, state_dim])
+        return final_state
+
+
+class StoryRNN:
+    '''Story RNN.'''
+
+    def __init__(self, params):
+        '''Constructor for Story RNN.'''
+
+        self.params = params
+        state_dim = params.state_dim
+
+        with tf.variable_scope('StoryRNN'):
+            # sentence encoder
+            self.encoder = SentenceEncoder(params)
+
+            self.rnn_cell = tf.nn.rnn_cell.BasicLSTMCell(
+                state_dim, name='sentence_cell')
+
+    def __call__(self, inputs, initial_state=None):
+        '''Process a batch of stories.
+
+        Args:
+            inputs: `Tensor` of shape [batch_size, sentence_count, num_steps]
+            initial_state: initial hidden states, default None
+
+        Returns:
+            LSTMStateTuple, c and h are of shape [batch_size, state_dim]
+        '''
+
+        sentence_embedding = self.encoder(inputs)
+        batch_size = tf.shape(sentence_embedding)[0]
+
+        # [sentence_count, batch_size, state_dim]
+        sentence_embedding = tf.transpose(sentence_embedding, [1, 0, 2])
+
+        if initial_state is None:
+            initial_state = self.rnn_cell.zero_state(batch_size, tf.float32)
+        _, final_state = tf.nn.dynamic_rnn(self.rnn_cell, sentence_embedding,
+            initial_state=initial_state, time_major=True)
+
+        return final_state
+
+    def step(self, state, inputs):
+        '''Make single step in RNN.
+
+        Args:
+            state: current hidden state, [batch_size, state_dim]
+            inputs: next sentence, [batch_size, num_steps]
+
+        Returns:
+            New state with shape [batch_size, state_dim]
+        '''
+
+        # [batch_size, state_dim]
+        state_dim = self.params.state_dim
+        inputs = tf.expand_dims(inputs, 1)
+        inputs = self.encoder(inputs)
+        inputs = tf.reshape(inputs, [-1, state_dim])
+
+        _, new_state = self.rnn_cell(inputs, state)
+        return new_state
+
+
+class ClozeClassifier:
+    '''Classifier for story cloze test.'''
+
+    def __init__(self, params):
+        '''Constructor for the classifier.'''
+
+        self.params = params
+        num_steps = params.max_sentence_length
+        state_dim = params.state_dim
+
+        with tf.variable_scope('ClozeClassifier'):
+            # context sentences
+            self.context = tf.placeholder(tf.int32, [None, CONTEXT_LENGTH, num_steps])
+            batch_size = tf.shape(self.context)[0]
+
+            # possible endings and whether ending is true/false
+            self.endings = tf.placeholder(tf.int32, [None, None, num_steps])
+            self.input_y = tf.placeholder(tf.int32, [None, None])
+            endings_per_context = tf.shape(self.endings)[1]
+
+            # expand context cell/hidden state
+            # shape [batch_size, endings_per_context, state_dim]
+            self.story_encoder = StoryRNN(params)
+            hidden_c, hidden_h = self.story_encoder(self.context)
+            hidden_c = tf.tile(tf.reshape(
+                hidden_c, [batch_size, 1, -1]), [1, endings_per_context, 1])
+            hidden_c = tf.reshape(hidden_c, [-1, state_dim])
+            hidden_h = tf.tile(tf.reshape(
+                hidden_h, [batch_size, 1, -1]), [1, endings_per_context, 1])
+            hidden_h = tf.reshape(hidden_h, [-1, state_dim])
+            hidden = tf.contrib.rnn.LSTMStateTuple(hidden_c, hidden_h)
+
+            # final encoded story
+            # shape [batch_size * endings_per_context, state_dim]
+            endings = tf.reshape(self.endings, [-1, num_steps])
+            hidden = self.story_encoder.step(hidden, endings)
+            hidden = hidden.h
+
+            hidden_dims = [int(x) for x in params.clf_hidden.split('-')]
+            for dim in hidden_dims:
+                hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
+
+            # prediction
+            self.logits = tf.layers.dense(hidden, 2, tf.nn.relu)
+            self.prediction = tf.argmax(self.logits, 1, output_type=tf.int32)
+            self.propability = tf.nn.softmax(self.logits, 1)
+
+            # training loss
+            labels = tf.reshape(self.input_y, [-1])
+            log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=labels, logits=self.logits)
+            self.loss = tf.reduce_mean(log_prob)
+
+            # prediction accuracy
+            correct_mask = tf.cast(tf.equal(self.prediction,
+                tf.reshape(self.input_y, [-1])), tf.float32)
+            self.accuracy = tf.reduce_mean(correct_mask)
+
+        # train op
+        global_step = tf.get_variable('global_step', initializer=tf.constant(0), trainable=False)
+        optimizer = tf.train.AdamOptimizer()
+        grads_and_vars = optimizer.compute_gradients(self.loss)
+        tgrads, tvars = zip(*grads_and_vars)
+        tgrads, _ = tf.clip_by_global_norm(tgrads, self.params.max_grad_norm)
+        grads_and_vars = zip(tgrads, tvars)
+        self.train_op = optimizer.apply_gradients(grads_and_vars, global_step)
+
+
+def batch_generator(corpus, params, fmt):
+    '''Batch generator.
+
+    Args:
+        corpus: train/val corpus
+        params: experiment parameters
+        fmt: 'train'/'val'
+    '''
+
+    assert fmt in ['train', 'val'], 'Unexpected value %s for fmt' % fmt
+
+    if fmt == 'train': # train corpus
+        X = corpus['story']
+        n = X.shape[0]
+        permut_idx = np.random.permutation(n)
+        n_batch = (n-1)//params.batch_size + 1
+
+        for batch in range(n_batch):
+            start = batch * params.batch_size
+            end = start + params.batch_size
+            idx = permut_idx[start:end] # permuted
+            batch_size = idx.shape[0]
+
+            # context
+            context = X[idx, :CONTEXT_LENGTH]
+            context = context[:, :, 1:] # remove BOS
+
+            # endings
+            correct_endings = X[idx, CONTEXT_LENGTH][None, :, :]
+            negative_endings = X[np.random.randint(
+                n, size=batch_size * params.negative_sampling), CONTEXT_LENGTH]
+            negative_endings = np.reshape(
+                negative_endings, (params.negative_sampling, batch_size, -1))
+            endings = np.concatenate(
+                (correct_endings, negative_endings), axis=0)
+            endings = np.transpose(endings, [1, 0, 2])
+            endings = endings[:, :, 1:] # remove BOS
+
+            # labels
+            labels = np.zeros((batch_size, 1+params.negative_sampling), np.int32)
+            labels[:, 0] = 1 # first column is correct ending
+
+            yield context, endings, labels
+    else: # validation corpus
+        X = corpus['context']
+        n = X.shape[0]
+        n_batch = (n-1)//params.batch_size + 1
+        all_idx = np.arange(n)
+
+        # convert answer to numpy array
+        answer = np.array(corpus['answer'], dtype=np.int32)
+
+        for batch in range(n_batch):
+            start = batch * params.batch_size
+            end = start + params.batch_size
+            idx = all_idx[start:end]
+            batch_size = idx.shape[0]
+
+            # context
+            context = X[idx]
+            context = context[:, :, 1:] # remove BOS
+
+            # endings
+            endings = corpus['endings'][idx]
+            endings = endings[:, :, 1:] # remove BOS
+
+            # labels
+            labels = np.zeros((batch_size, endings.shape[1]), np.int32)
+            labels[np.arange(batch_size), answer[idx]] = 1
+
+            yield context, endings, labels
+
+
+def train_step(sess, batch, model):
+    '''Make a single train step.
+
+    Args:
+        sess: Tensorflow session
+        batch: training batch
+        model: cloze classifier
+    '''
+
+    logger = logging.getLogger('__main__')
+
+    context, endings, labels = batch
+    feed_dict = {
+        model.context: context,
+        model.endings: endings,
+        model.input_y: labels
+    }
+    train_op = model.train_op
+    global_step = tf.train.get_global_step()
+    _, step, loss, accuracy, prediction = sess.run(
+        [train_op, global_step, model.loss,
+        model.accuracy, model.prediction], feed_dict)
+
+    logger.info('step %d, loss %f, accuracy %f' % (step, loss, accuracy))
+    logger.info('PREDICTION')
+    logger.info(prediction)
+    logger.info('LABEL')
+    logger.info(labels)
 
 
 def main():
@@ -425,8 +709,8 @@ def main():
                         help='Embedding dimension, default 300')
     parser.add_argument('--state_dim', type=int, default=512,
                         help='LSTM cell hidden state dimension (for c and h), default 512')
-    parser.add_argument('--hidden_proj_dim', type=int, default=None,
-                        help='Project hidden output before softmax, default None')
+    parser.add_argument('--clf_hidden', type=str, default='1024-256',
+                        help='Hidden layer dimensions for ending classifier')
     # input data preprocessing
     parser.add_argument('--train_corpus', type=str, default='data/train.csv',
                         help='Path to training corpus')
@@ -440,6 +724,15 @@ def main():
                         help='Path to pretrained word embedding')
     parser.add_argument('--max_pretrained_vocab_size', type=int, default=1000000,
                         help='Maximum pretrained tokens to read, default 1000000')
+    # training
+    parser.add_argument('--batch_size', type=int,
+                        default=32, help='Batch size')
+    parser.add_argument('--n_epoch', type=int, default=10,
+                        help='Training epoch number, default 10')
+    parser.add_argument('--negative_sampling', type=int,
+                        default=5, help='Negative sampling')
+    parser.add_argument('--max_grad_norm', type=float,
+                        default=5.0, help='Maximum gradient norm')
     # experiment path
     parser.add_argument('--exp_path', type=str, default=None,
                         help='Experiment path')
@@ -482,8 +775,20 @@ def main():
     train_corpus = transform_corpus(train_corpus, dico, params, 'train')
     val_corpus = transform_corpus(val_corpus, dico, params, 'val')
 
-    # embedding
-    embedding = load_pretrained_embeddings(params.pretrained, params)
+    # classifier
+    logger.info('Building model')
+    model = ClozeClassifier(params)
+
+    # train
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+
+        val_corpus['context'] = val_corpus['context'][:100]
+        val_corpus['endings'] = val_corpus['endings'][:100]
+        for epoch in range(1, 1+params.n_epoch):
+            logger.info('Start of epoch #%d' % epoch)
+            for batch in batch_generator(val_corpus, params, 'val'):
+                train_step(sess, batch, model)
 
 
 if __name__ == '__main__':
