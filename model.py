@@ -189,7 +189,7 @@ def preprocess_corpus(corpus, params, fmt):
 
     # helper function to transform each item of d[k] by f
     def transform(d, k, f):
-        d[k] = [[f(sen) for sen in sample] for sample in d[k][:10]]
+        d[k] = [[f(sen) for sen in sample] for sample in d[k]]
 
     # replace name of person to `Person`
     def replace_person(sentence):
@@ -268,7 +268,7 @@ def build_dictionary(corpus, params):
         A dictionary mapping token to index
     '''
 
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger('__main__')
     logger.info('Building dictionary from training corpus')
 
     dico = load_obj('dico')
@@ -317,7 +317,7 @@ def transform_corpus(corpus, dico, params, fmt):
 
     assert fmt in ['train', 'val'], ('Unexpected value %s for `fmt`' % fmt)
 
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger('__main__')
     logger.info('Transforming %s corpus' % fmt)
 
     objname = fmt + '_corpus_transformed'
@@ -328,7 +328,7 @@ def transform_corpus(corpus, dico, params, fmt):
 
     # helper function to transform each item of d[k] by f
     def transform(d, k, f):
-        d[k] = [[f(sen) for sen in sample] for sample in d[k][:10]]
+        d[k] = [[f(sen) for sen in sample] for sample in d[k]]
 
     def word2id(sen):
         return list(map(lambda token: dico.get(token, dico[UNK]), sen))
@@ -352,6 +352,66 @@ def transform_corpus(corpus, dico, params, fmt):
     return corpus
 
 
+def load_pretrained_embeddings(path, params):
+    '''Load pretrained word embeddings.
+
+    Args:
+        path: path to pretrained word embeddings
+        params: experiment parameters
+
+    Returns:
+        A `Tensor` with shape [dico_size, emb_dim]
+    '''
+
+    logger = logging.getLogger('__main__')
+    logger.info('Loading pretrained embedding from %s' % params.pretrained)
+
+    # read embedding
+    logger.info('Reading file')
+    embedding = np.empty(
+        shape=[params.dico_size, params.emb_dim], dtype=np.float)
+    found_tokens = set()
+    with open(params.pretrained, 'r') as f:
+        for i, line in enumerate(f):
+            # early break
+            if (params.max_pretrained_vocab_size is not None and
+                i > params.max_pretrained_vocab_size):
+                logger.info('Reach maximum pretrained vocab size %d' %
+                            params.max_pretrained_vocab_size)
+                break
+
+            line = line.strip().split()
+            if i == 0: # first line
+                assert len(line) == 2, 'Invalid format at first line'
+                _, dim = map(int, line)
+                assert dim == params.emb_dim, 'Config to load embedding of ' \
+                    'dimension %d but see %d' % (params.emb_dim, dim)
+            else: # embedding line
+                token = line[0]
+                token_id = params.dico.get(token, -1)
+                if token_id < 0: # not in dico
+                    continue
+                try:
+                    embedding[token_id] = np.array(
+                        list(map(float, line[1:])), dtype=np.float)
+                    found_tokens.add(token)
+                except ValueError:
+                    continue
+
+    # check unfound tokens
+    logger.info('Checking unfound tokens')
+    unfound_cnt = 0
+    for token in params.dico.keys() - found_tokens:
+        unfound_cnt += 1
+        logger.info('Cannot load pretrained embedding for token %s' % token)
+        embedding[params.dico[token]] = np.random.uniform(
+            low=-0.25, high=0.25, size=params.emb_dim)
+
+    logger.info('%d tokens not found in %s' % (unfound_cnt, path))
+    logger.info('Finish loading pretrained embedding')
+    return tf.convert_to_tensor(embedding, dtype=tf.float32)
+
+
 def main():
     '''Main function.'''
 
@@ -361,8 +421,8 @@ def main():
     # parser for command line arguments
     parser = argparse.ArgumentParser(description='NLU project 2')
     # network architecture
-    parser.add_argument('--emb_dim', type=int, default=100,
-                        help='Embedding dimension, default 100')
+    parser.add_argument('--emb_dim', type=int, default=300,
+                        help='Embedding dimension, default 300')
     parser.add_argument('--state_dim', type=int, default=512,
                         help='LSTM cell hidden state dimension (for c and h), default 512')
     parser.add_argument('--hidden_proj_dim', type=int, default=None,
@@ -376,6 +436,10 @@ def main():
                         help='Maximum sentence length to keep, default 40')
     parser.add_argument('--vocab_size', type=int, default=20000,
                         help='Vocabulary size, default 20000')
+    parser.add_argument('--pretrained', type=str, default='vec/fasttext.vec',
+                        help='Path to pretrained word embedding')
+    parser.add_argument('--max_pretrained_vocab_size', type=int, default=1000000,
+                        help='Maximum pretrained tokens to read, default 1000000')
     # experiment path
     parser.add_argument('--exp_path', type=str, default=None,
                         help='Experiment path')
@@ -409,10 +473,17 @@ def main():
     train_corpus = preprocess_corpus(train_corpus, params, 'train')
     val_corpus = preprocess_corpus(val_corpus, params, 'val')
 
-    # build dictionary and transforming corpors
+    # build dictionary
     dico = build_dictionary(train_corpus, params)
+    params.dico = dico
+    params.dico_size = len(dico)
+
+    # transform corpus
     train_corpus = transform_corpus(train_corpus, dico, params, 'train')
     val_corpus = transform_corpus(val_corpus, dico, params, 'val')
+
+    # embedding
+    embedding = load_pretrained_embeddings(params.pretrained, params)
 
 
 if __name__ == '__main__':
