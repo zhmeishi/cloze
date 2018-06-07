@@ -100,16 +100,17 @@ def load_corpus(path, params, fmt):
     Args:
         path: corpus path
         params: experiment parameters
-        fmt: 'train'/'val'
+        fmt: 'train'/'val'/'test'
 
     Returns:
         fmt == 'train':
             A dictionary with key 'id', 'title', 'story'
-        fmt == 'val':
+        fmt == 'val'/'test':
             A dictionary with key 'id', 'context', 'endings', 'answer'
     '''
 
-    assert fmt in ['train', 'val'], ('Unexpected value %s for `fmt`' % fmt)
+    assert fmt in ['train', 'val', 'test'], (
+        'Unexpected value %s for `fmt`' % fmt)
 
     logger = logging.getLogger('__main__')
     logger.info('Loading %s corpus from %s' % (fmt, path))
@@ -136,9 +137,9 @@ def load_corpus(path, params, fmt):
         return train_corpus
     else:
         # validation corpus
-        val_corpus = load_obj('val_corpus')
+        val_corpus = load_obj(fmt + '_corpus')
         if val_corpus is not None:
-            logger.info('Use saved val_corpus')
+            logger.info('Use saved %s_corpus' % fmt)
             return val_corpus
 
         storyid = list(csv['InputStoryid'])
@@ -160,7 +161,7 @@ def load_corpus(path, params, fmt):
         answer = [(answer_id-1) for answer_id in answer]
 
         val_corpus = {'id': storyid, 'context': context, 'endings': endings, 'answer': answer}
-        save_obj('val_corpus', val_corpus)
+        save_obj(fmt + '_corpus', val_corpus)
         return val_corpus
 
 
@@ -170,13 +171,14 @@ def preprocess_corpus(corpus, params, fmt):
     Args:
         corpus: corpus to preprocess
         params: experiment parameters
-        fmt: 'train'/'val'
+        fmt: 'train'/'val'/'test'
 
     Returns:
         Preprocessed corpus
     '''
 
-    assert fmt in ['train', 'val'], ('Unexpected value %s for `fmt`' % fmt)
+    assert fmt in ['train', 'val', 'test'], (
+        'Unexpected value %s for `fmt`' % fmt)
 
     logger = logging.getLogger('__main__')
     logger.info('Preprocessing %s corpus' % fmt)
@@ -246,7 +248,7 @@ def preprocess_corpus(corpus, params, fmt):
         transform(corpus, 'story', lambda l: list(map(normalize_word, l)))
         transform(corpus, 'story', normalize_sentence)
     else:
-        # val corpus
+        # val/test corpus
         transform(corpus, 'context', replace_person)
         transform(corpus, 'context', lambda l: list(map(normalize_word, l)))
         transform(corpus, 'context', normalize_sentence)
@@ -310,13 +312,14 @@ def transform_corpus(corpus, dico, params, fmt):
         corpus: corpus to be transformed
         dico: a mapping from token to index
         params: experiment parameters
-        fmt: 'train'/'val'
+        fmt: 'train'/'val'/'test'
 
     Returns:
         A transformed corpus
     '''
 
-    assert fmt in ['train', 'val'], ('Unexpected value %s for `fmt`' % fmt)
+    assert fmt in ['train', 'val', 'test'], (
+        'Unexpected value %s for `fmt`' % fmt)
 
     logger = logging.getLogger('__main__')
     logger.info('Transforming %s corpus' % fmt)
@@ -340,13 +343,13 @@ def transform_corpus(corpus, dico, params, fmt):
         corpus['story'] = np.array(corpus['story'], dtype=np.int32)
         logger.info('Train corpus story shape ' + str(corpus['story'].shape))
     else:
-        # validation corpus
+        # validation/test corpus
         transform(corpus, 'context', word2id)
         corpus['context'] = np.array(corpus['context'], dtype=np.int32)
-        logger.info('Validation corpus context shape ' + str(corpus['context'].shape))
+        logger.info('Validation/Test corpus context shape ' + str(corpus['context'].shape))
         transform(corpus, 'endings', word2id)
         corpus['endings'] = np.array(corpus['endings'], dtype=np.int32)
-        logger.info('Validation corpus endings shape ' + str(corpus['endings'].shape))
+        logger.info('Validation/Test corpus endings shape ' + str(corpus['endings'].shape))
 
     logger.info('Finished transforming corpus')
     save_obj(objname, corpus)
@@ -425,10 +428,11 @@ class SentenceEncoder:
         with tf.variable_scope('SentenceEncoder'):
             # embeddings
             if params.pretrained is not None:
-                pretrained = load_pretrained_embeddings(params.pretrained, params)
+                pretrained = load_pretrained_embeddings(
+                    params.pretrained, params)
                 pretrained = tf.convert_to_tensor(pretrained, tf.float32)
                 self.embeddingW = tf.get_variable(
-                    'embeddingW', None, tf.float32, pretrained)
+                    'embeddingW', None, tf.float32, pretrained, trainable=False)
             else:
                 vocab_size, emb_dim = params.vocab_size, params.emb_dim
                 self.embeddingW = tf.get_variable(
@@ -549,8 +553,12 @@ class ClozeClassifier:
         state_dim = params.state_dim
 
         with tf.variable_scope('ClozeClassifier'):
+            # train/eval mode
+            self.training = tf.placeholder(tf.bool, [])
+
             # context sentences
-            self.context = tf.placeholder(tf.int32, [None, CONTEXT_LENGTH, num_steps])
+            self.context = tf.placeholder(
+                tf.int32, [None, None, num_steps])
             batch_size = tf.shape(self.context)[0]
 
             # possible endings and whether ending is true/false
@@ -581,6 +589,7 @@ class ClozeClassifier:
             #     hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
 
             # prediction
+            hidden = tf.layers.dropout(hidden, 0.5, training=self.training)
             self.logits = tf.layers.dense(hidden, 2, None,
                 kernel_initializer=tf.contrib.layers.xavier_initializer())
             self.prediction = tf.argmax(self.logits, 1, output_type=tf.int32)
@@ -598,7 +607,8 @@ class ClozeClassifier:
             self.accuracy = tf.reduce_mean(correct_mask)
 
         # train op
-        global_step = tf.get_variable('global_step', initializer=tf.constant(0), trainable=False)
+        global_step = tf.get_variable(
+            'global_step', initializer=tf.constant(0), trainable=False)
         optimizer = tf.train.AdamOptimizer()
         grads_and_vars = optimizer.compute_gradients(self.loss)
         tgrads, tvars = zip(*grads_and_vars)
@@ -709,7 +719,8 @@ def train_step(sess, batch, model):
     feed_dict = {
         model.context: context,
         model.endings: endings,
-        model.input_y: labels
+        model.input_y: labels,
+        model.training: True
     }
     train_op = model.train_op
     global_step = tf.train.get_global_step()
@@ -737,7 +748,8 @@ def val_step(sess, batch, model):
     feed_dict = {
         model.context: context,
         model.endings: endings,
-        model.input_y: labels
+        model.input_y: labels,
+        model.training: False
     }
     loss, accuracy, prediction = sess.run(
         [model.loss, model.accuracy, model.prediction], feed_dict)
@@ -769,6 +781,8 @@ def main():
                         help='Path to training corpus')
     parser.add_argument('--val_corpus', type=str, default='data/val.csv',
                         help='Path to evaluation corpus')
+    parser.add_argument('--test_corpus', type=str, default='data/test.csv',
+                        help='Path to test corpus')
     parser.add_argument('--max_sentence_length', type=int, default=40,
                         help='Maximum sentence length to keep, default 40')
     parser.add_argument('--vocab_size', type=int, default=20000,
@@ -814,10 +828,12 @@ def main():
     # load training and validation corpora
     train_corpus = load_corpus(params.train_corpus, params, 'train')
     val_corpus = load_corpus(params.val_corpus, params, 'val')
+    test_corpus = load_corpus(params.test_corpus, params, 'test')
 
     # preprocess corpora
     train_corpus = preprocess_corpus(train_corpus, params, 'train')
     val_corpus = preprocess_corpus(val_corpus, params, 'val')
+    test_corpus = preprocess_corpus(test_corpus, params, 'test')
 
     # build dictionary
     dico = build_dictionary(train_corpus, params)
@@ -827,6 +843,7 @@ def main():
     # transform corpus
     train_corpus = transform_corpus(train_corpus, dico, params, 'train')
     val_corpus = transform_corpus(val_corpus, dico, params, 'val')
+    test_corpus = transform_corpus(test_corpus, dico, params, 'test')
 
     # classifier
     logger.info('Building model')
@@ -851,13 +868,16 @@ def main():
 
         for epoch in range(1, 1+params.n_epoch):
             logger.info('Start of epoch #%d' % epoch)
-            # for batch in batch_generator(train_corpus, params, 'train', val_corpus['endings'][:, 1]):
+            # for batch in batch_generator(train_corpus, params,
+            #     'train', val_corpus['endings'][:, 1]):
             #     train_step(sess, batch, model)
             for batch in batch_generator(val_corpus, params, 'val'):
                 train_step(sess, batch, model)
             for batch in batch_generator(val_corpus, params, 'test'):
                 val_step(sess, batch, model)
             for batch in batch_generator(dev_corpus, params, 'test'):
+                val_step(sess, batch, model)
+            for batch in batch_generator(test_corpus, params, 'test'):
                 val_step(sess, batch, model)
 
 
