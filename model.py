@@ -1,6 +1,7 @@
 import tensorflow as tf
 import pandas as pd
 import numpy as np
+import sklearn
 import nltk
 
 import argparse
@@ -589,11 +590,17 @@ class ClozeClassifier:
             #     hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
 
             # prediction
-            hidden = tf.layers.dropout(hidden, 0.5, training=self.training)
+            hidden = tf.layers.dropout(hidden, 0.75, training=self.training)
             self.logits = tf.layers.dense(hidden, 2, None,
                 kernel_initializer=tf.contrib.layers.xavier_initializer())
             self.prediction = tf.argmax(self.logits, 1, output_type=tf.int32)
-            self.propability = tf.nn.softmax(self.logits, 1)
+            self.probability = tf.nn.softmax(self.logits, 1)
+
+            # choose in all endings
+            probability = tf.reshape(
+                self.probability, [batch_size, endings_per_context, 2])
+            self.prefer = tf.argmax(
+                probability[:, :, 1], 1, output_type=tf.int32)
 
             # training loss
             labels = tf.reshape(self.input_y, [-1])
@@ -751,11 +758,15 @@ def val_step(sess, batch, model):
         model.input_y: labels,
         model.training: False
     }
-    loss, accuracy, prediction = sess.run(
-        [model.loss, model.accuracy, model.prediction], feed_dict)
+    loss, accuracy, prediction, prefer = sess.run(
+        [model.loss, model.accuracy, model.prediction, model.prefer], feed_dict)
 
     logger.info('Validation with %d stories' % context.shape[0])
     logger.info('Validation loss %f, accuracy %f' % (loss, accuracy))
+
+    answer = np.where(labels==1)[1]
+    prediction_accuracy = sklearn.metrics.accuracy_score(answer, prefer)
+    logger.info('Prediction accuracy %f' % prediction_accuracy)
 
     return prediction
 
