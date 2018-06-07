@@ -424,10 +424,16 @@ class SentenceEncoder:
 
         with tf.variable_scope('SentenceEncoder'):
             # embeddings
-            pretrained = load_pretrained_embeddings(params.pretrained, params)
-            pretrained = tf.convert_to_tensor(pretrained, tf.float32)
-            self.embeddingW = tf.get_variable(
-                'embeddingW', None, tf.float32, pretrained)
+            if params.pretrained is not None:
+                pretrained = load_pretrained_embeddings(params.pretrained, params)
+                pretrained = tf.convert_to_tensor(pretrained, tf.float32)
+                self.embeddingW = tf.get_variable(
+                    'embeddingW', None, tf.float32, pretrained)
+            else:
+                vocab_size, emb_dim = params.vocab_size, params.emb_dim
+                self.embeddingW = tf.get_variable(
+                    'embeddingW', [vocab_size, emb_dim], tf.float32,
+                    tf.contrib.layers.xavier_initializer())
 
             # RNN cell
             self.rnn_cell = tf.nn.rnn_cell.LSTMCell(state_dim,
@@ -601,13 +607,14 @@ class ClozeClassifier:
         self.train_op = optimizer.apply_gradients(grads_and_vars, global_step)
 
 
-def batch_generator(corpus, params, fmt):
+def batch_generator(corpus, params, fmt, negative_choices=None):
     '''Batch generator.
 
     Args:
         corpus: train/val corpus
         params: experiment parameters
         fmt: 'train'/'val'/'test'
+        negative_choices: set of negative endings
     '''
 
     assert fmt in ['train', 'val', 'test'], 'Unexpected value %s for fmt' % fmt
@@ -630,8 +637,14 @@ def batch_generator(corpus, params, fmt):
 
             # endings
             correct_endings = X[idx, CONTEXT_LENGTH][None, :, :]
-            negative_endings = X[np.random.randint(
-                n, size=batch_size * params.negative_sampling), CONTEXT_LENGTH]
+            num_negatives = batch_size * params.negative_sampling
+            if negative_choices is None:
+                negative_endings = X[np.random.randint(
+                    n, size=num_negatives), CONTEXT_LENGTH]
+            else:
+                m = negative_choices.shape[0]
+                negative_endings = negative_choices[np.random.randint(
+                    m, size=num_negatives)]
             negative_endings = np.reshape(
                 negative_endings, (params.negative_sampling, batch_size, -1))
             endings = np.concatenate(
@@ -760,8 +773,8 @@ def main():
                         help='Maximum sentence length to keep, default 40')
     parser.add_argument('--vocab_size', type=int, default=20000,
                         help='Vocabulary size, default 20000')
-    parser.add_argument('--pretrained', type=str, default='vec/fasttext.vec',
-                        help='Path to pretrained word embedding')
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path to pretrained word embedding, default None')
     parser.add_argument('--max_pretrained_vocab_size', type=int, default=1000000,
                         help='Maximum pretrained tokens to read, default 1000000')
     # training
@@ -838,12 +851,14 @@ def main():
 
         for epoch in range(1, 1+params.n_epoch):
             logger.info('Start of epoch #%d' % epoch)
-            for batch in batch_generator(train_corpus, params, 'train'):
+            # for batch in batch_generator(train_corpus, params, 'train', val_corpus['endings'][:, 1]):
+            #     train_step(sess, batch, model)
+            for batch in batch_generator(val_corpus, params, 'val'):
                 train_step(sess, batch, model)
             for batch in batch_generator(val_corpus, params, 'test'):
-                train_step(sess, batch, model)
+                val_step(sess, batch, model)
             for batch in batch_generator(dev_corpus, params, 'test'):
-                prediction = val_step(sess, batch, model)
+                val_step(sess, batch, model)
 
 
 if __name__ == '__main__':
