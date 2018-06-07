@@ -430,8 +430,9 @@ class SentenceEncoder:
                 'embeddingW', None, tf.float32, pretrained)
 
             # RNN cell
-            self.rnn_cell = tf.nn.rnn_cell.BasicLSTMCell(
-                state_dim, name='word_cell')
+            self.rnn_cell = tf.nn.rnn_cell.LSTMCell(state_dim,
+                initializer=tf.contrib.layers.xavier_initializer(),
+                name='word_cell')
 
     def __call__(self, inputs):
         '''Encode input sentence.
@@ -455,9 +456,14 @@ class SentenceEncoder:
         embedding = tf.nn.embedding_lookup(self.embeddingW, inputs)
         embedding = tf.transpose(embedding, [1, 0, 2])
 
+        # sentence length
+        eos_pos = tf.where(tf.equal(inputs,
+            tf.constant(self.params.dico[EOS])))[:, 1]
+
         initial_state = self.rnn_cell.zero_state(batch_size, tf.float32)
         _, final_state = tf.nn.dynamic_rnn(self.rnn_cell, embedding,
-            initial_state=initial_state, time_major=True)
+            sequence_length=eos_pos, initial_state=initial_state,
+            time_major=True)
 
         final_state = final_state.h
         final_state = tf.reshape(final_state, [-1, sentence_count, state_dim])
@@ -477,8 +483,9 @@ class StoryRNN:
             # sentence encoder
             self.encoder = SentenceEncoder(params)
 
-            self.rnn_cell = tf.nn.rnn_cell.BasicLSTMCell(
-                state_dim, name='sentence_cell')
+            self.rnn_cell = tf.nn.rnn_cell.LSTMCell(state_dim,
+                initializer=tf.contrib.layers.xavier_initializer(),
+                name='sentence_cell')
 
     def __call__(self, inputs, initial_state=None):
         '''Process a batch of stories.
@@ -563,12 +570,13 @@ class ClozeClassifier:
             hidden = self.story_encoder.step(hidden, endings)
             hidden = hidden.h
 
-            hidden_dims = [int(x) for x in params.clf_hidden.split('-')]
-            for dim in hidden_dims:
-                hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
+            # hidden_dims = [int(x) for x in params.clf_hidden.split('-')]
+            # for dim in hidden_dims:
+            #     hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
 
             # prediction
-            self.logits = tf.layers.dense(hidden, 2, tf.nn.relu)
+            self.logits = tf.layers.dense(hidden, 2, None,
+                kernel_initializer=tf.contrib.layers.xavier_initializer())
             self.prediction = tf.argmax(self.logits, 1, output_type=tf.int32)
             self.propability = tf.nn.softmax(self.logits, 1)
 
@@ -579,8 +587,8 @@ class ClozeClassifier:
             self.loss = tf.reduce_mean(log_prob)
 
             # prediction accuracy
-            correct_mask = tf.cast(tf.equal(self.prediction,
-                tf.reshape(self.input_y, [-1])), tf.float32)
+            correct_mask = tf.cast(
+                tf.equal(self.prediction, labels), tf.float32)
             self.accuracy = tf.reduce_mean(correct_mask)
 
         # train op
@@ -599,10 +607,10 @@ def batch_generator(corpus, params, fmt):
     Args:
         corpus: train/val corpus
         params: experiment parameters
-        fmt: 'train'/'val'
+        fmt: 'train'/'val'/'test'
     '''
 
-    assert fmt in ['train', 'val'], 'Unexpected value %s for fmt' % fmt
+    assert fmt in ['train', 'val', 'test'], 'Unexpected value %s for fmt' % fmt
 
     if fmt == 'train': # train corpus
         X = corpus['story']
@@ -636,7 +644,7 @@ def batch_generator(corpus, params, fmt):
             labels[:, 0] = 1 # first column is correct ending
 
             yield context, endings, labels
-    else: # validation corpus
+    else: # validation/test corpus
         X = corpus['context']
         n = X.shape[0]
         n_batch = (n-1)//params.batch_size + 1
@@ -645,24 +653,31 @@ def batch_generator(corpus, params, fmt):
         # convert answer to numpy array
         answer = np.array(corpus['answer'], dtype=np.int32)
 
-        for batch in range(n_batch):
-            start = batch * params.batch_size
-            end = start + params.batch_size
-            idx = all_idx[start:end]
-            batch_size = idx.shape[0]
+        if fmt == 'val': # validation corpus (for training)
+            for batch in range(n_batch):
+                start = batch * params.batch_size
+                end = start + params.batch_size
+                idx = all_idx[start:end]
+                batch_size = idx.shape[0]
 
-            # context
-            context = X[idx]
-            context = context[:, :, 1:] # remove BOS
+                # context
+                context = X[idx]
+                context = context[:, :, 1:] # remove BOS
 
-            # endings
-            endings = corpus['endings'][idx]
-            endings = endings[:, :, 1:] # remove BOS
+                # endings
+                endings = corpus['endings'][idx]
+                endings = endings[:, :, 1:] # remove BOS
 
-            # labels
-            labels = np.zeros((batch_size, endings.shape[1]), np.int32)
-            labels[np.arange(batch_size), answer[idx]] = 1
+                # labels
+                labels = np.zeros((batch_size, endings.shape[1]), np.int32)
+                labels[np.arange(batch_size), answer[idx]] = 1
 
+                yield context, endings, labels
+        else: # test corpus (for evaludation)
+            context = corpus['context'][:, :, 1:] # remove BOS
+            endings = corpus['endings'][:, :, 1:] # remove BOS
+            labels = np.zeros((n, endings.shape[1]), np.int32)
+            labels[np.arange(n), answer] = 1
             yield context, endings, labels
 
 
@@ -685,17 +700,41 @@ def train_step(sess, batch, model):
     }
     train_op = model.train_op
     global_step = tf.train.get_global_step()
-    _, step, loss, accuracy, prediction = sess.run(
-        [train_op, global_step, model.loss,
-        model.accuracy, model.prediction], feed_dict)
+    _, step, loss, accuracy = sess.run(
+        [train_op, global_step, model.loss, model.accuracy], feed_dict)
 
     logger.info('step %d, loss %f, accuracy %f' % (step, loss, accuracy))
-    logger.info('PREDICTION')
-    logger.info(prediction)
-    logger.info('LABEL')
-    logger.info(labels)
 
 
+def val_step(sess, batch, model):
+    '''Make a single validation step.
+
+    Args:
+        sess: Tensorflow session
+        batch: training batch
+        model: cloze classifier
+
+    Returns:
+        prediction
+    '''
+
+    logger = logging.getLogger('__main__')
+
+    context, endings, labels = batch
+    feed_dict = {
+        model.context: context,
+        model.endings: endings,
+        model.input_y: labels
+    }
+    loss, accuracy, prediction = sess.run(
+        [model.loss, model.accuracy, model.prediction], feed_dict)
+
+    logger.info('Validation with %d stories' % context.shape[0])
+    logger.info('Validation loss %f, accuracy %f' % (loss, accuracy))
+
+    return prediction
+
+    
 def main():
     '''Main function.'''
 
@@ -708,7 +747,8 @@ def main():
     parser.add_argument('--emb_dim', type=int, default=300,
                         help='Embedding dimension, default 300')
     parser.add_argument('--state_dim', type=int, default=512,
-                        help='LSTM cell hidden state dimension (for c and h), default 512')
+                        help='LSTM cell hidden state dimension ' +
+                        '(for c and h), default 512')
     parser.add_argument('--clf_hidden', type=str, default='1024-256',
                         help='Hidden layer dimensions for ending classifier')
     # input data preprocessing
@@ -730,7 +770,7 @@ def main():
     parser.add_argument('--n_epoch', type=int, default=10,
                         help='Training epoch number, default 10')
     parser.add_argument('--negative_sampling', type=int,
-                        default=5, help='Negative sampling')
+                        default=1, help='Negative sampling, default 1')
     parser.add_argument('--max_grad_norm', type=float,
                         default=5.0, help='Maximum gradient norm')
     # experiment path
@@ -779,16 +819,31 @@ def main():
     logger.info('Building model')
     model = ClozeClassifier(params)
 
+    # train/val split
+    n_train = int(0.9 * val_corpus['context'].shape[0])
+    dev_corpus = {
+        'context': val_corpus['context'][n_train:],
+        'endings': val_corpus['endings'][n_train:],
+        'answer': val_corpus['answer'][n_train:]
+    }
+    val_corpus = {
+        'context': val_corpus['context'][:n_train],
+        'endings': val_corpus['endings'][:n_train],
+        'answer': val_corpus['answer'][:n_train]
+    }
+
     # train
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
 
-        val_corpus['context'] = val_corpus['context'][:100]
-        val_corpus['endings'] = val_corpus['endings'][:100]
         for epoch in range(1, 1+params.n_epoch):
             logger.info('Start of epoch #%d' % epoch)
-            for batch in batch_generator(val_corpus, params, 'val'):
+            for batch in batch_generator(train_corpus, params, 'train'):
                 train_step(sess, batch, model)
+            for batch in batch_generator(val_corpus, params, 'test'):
+                train_step(sess, batch, model)
+            for batch in batch_generator(dev_corpus, params, 'test'):
+                prediction = val_step(sess, batch, model)
 
 
 if __name__ == '__main__':
