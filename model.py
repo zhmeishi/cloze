@@ -21,7 +21,6 @@ EOS = '<eos>'
 PAD = '<pad>'
 UNK = '<unk>'
 CONTEXT_LENGTH = 4
-SEED = 19980814
 
 
 def get_exp_path():
@@ -885,10 +884,6 @@ def main():
     parser.add_argument('--exp_path', type=str, default=None,
                         help='Experiment path')
     params = parser.parse_args()
-
-    # set random seeds
-    np.random.seed(SEED)
-    tf.set_random_seed(SEED)
 
     # parameter validation
     assert os.path.exists(params.train_corpus)

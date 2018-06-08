@@ -11,7 +11,7 @@ wget https://polybox.ethz.ch/index.php/s/AKbA8g7SeHwjU0R/download -O data/submit
 
 echo 'Downloading cached preprocessed files'
 
-wget https://polybox.ethz.ch/index.php/s/WxQB5uRK6o0RA4K/download -O tmp.zip
+wget https://polybox.ethz.ch/index.php/s/sC3Zq6hKywMvAAC/download -O tmp.zip
 unzip tmp.zip
 rm tmp.zip
 
