@@ -161,7 +161,8 @@ def load_corpus(path, params, fmt):
         # answer id to zero-based
         answer = [(answer_id-1) for answer_id in answer]
 
-        val_corpus = {'id': storyid, 'context': context, 'endings': endings, 'answer': answer}
+        val_corpus = {'id': storyid, 'context': context,
+                      'endings': endings, 'answer': answer}
         save_obj(fmt + '_corpus', val_corpus)
         return val_corpus
 
@@ -238,7 +239,7 @@ def preprocess_corpus(corpus, params, fmt):
 
         # padding
         sen = [BOS] + sen
-        sen = sen[:params.max_sentence_length]
+        sen = sen[:(params.max_sentence_length-1)]
         sen.append(EOS)
         sen.extend([PAD] * (params.max_sentence_length + 1 - len(sen)))
         return sen
@@ -288,7 +289,7 @@ def build_dictionary(corpus, params):
     for story in corpus['story']:
         for sentence in story:
             for token in sentence:
-                # skip BOS/EOS/PAD
+                # skip BOS/EOS/PAD/UNK
                 if token in dico:
                     continue
                 cnt = token_cnt.get(token, 0)
@@ -580,7 +581,7 @@ class ClozeClassifier:
             hidden = tf.contrib.rnn.LSTMStateTuple(hidden_c, hidden_h)
 
             # final encoded story
-            # shape [batch_size * endings_per_context, state_dim]
+            # shape [batch_size * endings_per_context, num_steps]
             endings = tf.reshape(self.endings, [-1, num_steps])
             hidden = self.story_encoder.step(hidden, endings)
             hidden = hidden.h
@@ -762,11 +763,11 @@ def val_step(sess, batch, model):
         [model.loss, model.accuracy, model.prediction, model.prefer], feed_dict)
 
     logger.info('Validation with %d stories' % context.shape[0])
-    logger.info('Validation loss %f, accuracy %f' % (loss, accuracy))
 
     answer = np.where(labels==1)[1]
     prediction_accuracy = sklearn.metrics.accuracy_score(answer, prefer)
-    logger.info('Prediction accuracy %f' % prediction_accuracy)
+    logger.info('Validation loss %f, clf acc %f, pred acc %f' %
+        (loss, accuracy, prediction_accuracy))
 
     return prediction
 
@@ -782,11 +783,11 @@ def main():
     # network architecture
     parser.add_argument('--emb_dim', type=int, default=300,
                         help='Embedding dimension, default 300')
-    parser.add_argument('--state_dim', type=int, default=512,
+    parser.add_argument('--state_dim', type=int, default=64,
                         help='LSTM cell hidden state dimension ' +
-                        '(for c and h), default 512')
-    parser.add_argument('--clf_hidden', type=str, default='1024-256',
-                        help='Hidden layer dimensions for ending classifier')
+                        '(for c and h), default 64')
+    # parser.add_argument('--clf_hidden', type=str, default='1024-256',
+    #                     help='Hidden layer dimensions for ending classifier')
     # input data preprocessing
     parser.add_argument('--train_corpus', type=str, default='data/train.csv',
                         help='Path to training corpus')
@@ -819,6 +820,9 @@ def main():
     # parameter validation
     assert os.path.exists(params.train_corpus)
     assert os.path.exists(params.val_corpus)
+    assert os.path.exists(params.test_corpus)
+    if params.pretrained is not None:
+        assert os.path.exists(params.pretrained)
 
     # experiment path
     if params.exp_path is None:
@@ -836,7 +840,7 @@ def main():
     logger.info('\n\t' + '\n\t'.join('%s: %s' % (k, str(v))
         for k, v in sorted(dict(vars(params)).items())))
 
-    # load training and validation corpora
+    # load corpora
     train_corpus = load_corpus(params.train_corpus, params, 'train')
     val_corpus = load_corpus(params.val_corpus, params, 'val')
     test_corpus = load_corpus(params.test_corpus, params, 'test')
@@ -851,7 +855,7 @@ def main():
     params.dico = dico
     params.dico_size = len(dico)
 
-    # transform corpus
+    # transform corpora
     train_corpus = transform_corpus(train_corpus, dico, params, 'train')
     val_corpus = transform_corpus(val_corpus, dico, params, 'val')
     test_corpus = transform_corpus(test_corpus, dico, params, 'test')
@@ -884,10 +888,16 @@ def main():
             #     train_step(sess, batch, model)
             for batch in batch_generator(val_corpus, params, 'val'):
                 train_step(sess, batch, model)
+
+            logger.info('Validation on val set')
             for batch in batch_generator(val_corpus, params, 'test'):
                 val_step(sess, batch, model)
+
+            logger.info('Validation on dev set')
             for batch in batch_generator(dev_corpus, params, 'test'):
                 val_step(sess, batch, model)
+
+            logger.info('Validation on test set')
             for batch in batch_generator(test_corpus, params, 'test'):
                 val_step(sess, batch, model)
 

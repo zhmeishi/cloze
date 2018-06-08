@@ -4,3 +4,4 @@ log/
 tmp/
 vec/
 __pycache__/
+run.sh
