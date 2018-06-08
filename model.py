@@ -586,12 +586,16 @@ class ClozeClassifier:
             hidden = self.story_encoder.step(hidden, endings)
             hidden = hidden.h
 
-            # hidden_dims = [int(x) for x in params.clf_hidden.split('-')]
-            # for dim in hidden_dims:
-            #     hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
+            if params.clf_hidden is not None:
+                hidden_dims = [int(x) for x in params.clf_hidden.split('-')]
+                for dim in hidden_dims:
+                    hidden = tf.layers.dropout(
+                        hidden, self.params.dropout, training=self.training)
+                    hidden = tf.layers.dense(hidden, dim, tf.nn.relu)
 
             # prediction
-            hidden = tf.layers.dropout(hidden, 0.75, training=self.training)
+            hidden = tf.layers.dropout(
+                hidden, self.params.dropout, training=self.training)
             self.logits = tf.layers.dense(hidden, 2, None,
                 kernel_initializer=tf.contrib.layers.xavier_initializer())
             self.prediction = tf.argmax(self.logits, 1, output_type=tf.int32)
@@ -786,8 +790,8 @@ def main():
     parser.add_argument('--state_dim', type=int, default=64,
                         help='LSTM cell hidden state dimension ' +
                         '(for c and h), default 64')
-    # parser.add_argument('--clf_hidden', type=str, default='1024-256',
-    #                     help='Hidden layer dimensions for ending classifier')
+    parser.add_argument('--clf_hidden', type=str, default=None,
+                        help='Hidden layer dimensions for ending classifier')
     # input data preprocessing
     parser.add_argument('--train_corpus', type=str, default='data/train.csv',
                         help='Path to training corpus')
@@ -804,6 +808,8 @@ def main():
     parser.add_argument('--max_pretrained_vocab_size', type=int, default=1000000,
                         help='Maximum pretrained tokens to read, default 1000000')
     # training
+    parser.add_argument('--dropout', type=float,
+                        default=0.75, help='Dropout rate')
     parser.add_argument('--batch_size', type=int,
                         default=32, help='Batch size')
     parser.add_argument('--n_epoch', type=int, default=10,
