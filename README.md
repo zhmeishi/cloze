@@ -17,21 +17,7 @@ This code is written in python. To use it you will need:
 
 ## Getting started
 
-You will first need to download the word embeddings and preprocess data. The embedding files are quite large (>5GB) so make sure there is enough space available.
-
-    sh get_data.sh
-
-Now, set up virtual environment.
-
-    conda create -n myenv pip python=3.6
-    source activate myenv
-    pip install --upgrade pip
-    pip install -r requirements.txt
-
-Then, train the model (need test.csv). Training needs near 3 minutes.
-
-    sh train.sh
-
+To reproduce the result, run `./reproduce.sh`. The script requires `virtualenv` to be installed.
 
 ## References
 

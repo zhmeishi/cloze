@@ -21,6 +21,7 @@ EOS = '<eos>'
 PAD = '<pad>'
 UNK = '<unk>'
 CONTEXT_LENGTH = 4
+SEED = 19980814
 
 
 def get_exp_path():
@@ -101,22 +102,28 @@ def load_corpus(path, params, fmt):
     Args:
         path: corpus path
         params: experiment parameters
-        fmt: 'train'/'val'/'test'
+        fmt: 'train'/'val'/'test'/'submit'
 
     Returns:
         fmt == 'train':
             A dictionary with key 'id', 'title', 'story'
         fmt == 'val'/'test':
             A dictionary with key 'id', 'context', 'endings', 'answer'
+        fmt == 'submit':
+            A dictionary with key 'context', 'endings'
     '''
 
-    assert fmt in ['train', 'val', 'test'], (
+    assert fmt in ['train', 'val', 'test', 'submit'], (
         'Unexpected value %s for `fmt`' % fmt)
 
     logger = logging.getLogger('__main__')
     logger.info('Loading %s corpus from %s' % (fmt, path))
 
-    csv = pd.read_csv(path)
+    if fmt == 'submit':
+        csv = pd.read_csv(path, header=None, encoding='latin2')
+    else:
+        csv = pd.read_csv(path)
+
     if fmt == 'train':
         # training corpus
         train_corpus = load_obj('train_corpus')
@@ -136,8 +143,8 @@ def load_corpus(path, params, fmt):
         train_corpus = {'id': storyid, 'title': title, 'story': story}
         save_obj('train_corpus', train_corpus)
         return train_corpus
-    else:
-        # validation corpus
+    elif fmt in ['val', 'test']:
+        # validation/test corpus
         val_corpus = load_obj(fmt + '_corpus')
         if val_corpus is not None:
             logger.info('Use saved %s_corpus' % fmt)
@@ -165,6 +172,25 @@ def load_corpus(path, params, fmt):
                       'endings': endings, 'answer': answer}
         save_obj(fmt + '_corpus', val_corpus)
         return val_corpus
+    else:
+        # submission corpus
+        context = [list(csv[i]) for i in range(CONTEXT_LENGTH)]
+        endings = [list(csv[i])
+                   for i in range(CONTEXT_LENGTH, CONTEXT_LENGTH + 2)]
+
+        # transpose and tokenize context
+        context = list(zip(*context))
+        context = [[nltk.word_tokenize(sen) for sen in sample]
+                   for sample in context]
+
+        # transpose and tokenize endings
+        endings = list(zip(*endings))
+        endings = [[nltk.word_tokenize(sen) for sen in sample]
+                   for sample in endings]
+
+        corpus = {'context': context, 'endings': endings}
+        save_obj('submit_corpus', corpus)
+        return corpus
 
 
 def preprocess_corpus(corpus, params, fmt):
@@ -173,13 +199,13 @@ def preprocess_corpus(corpus, params, fmt):
     Args:
         corpus: corpus to preprocess
         params: experiment parameters
-        fmt: 'train'/'val'/'test'
+        fmt: 'train'/'val'/'test'/'submit'
 
     Returns:
         Preprocessed corpus
     '''
 
-    assert fmt in ['train', 'val', 'test'], (
+    assert fmt in ['train', 'val', 'test', 'submit'], (
         'Unexpected value %s for `fmt`' % fmt)
 
     logger = logging.getLogger('__main__')
@@ -250,7 +276,7 @@ def preprocess_corpus(corpus, params, fmt):
         transform(corpus, 'story', lambda l: list(map(normalize_word, l)))
         transform(corpus, 'story', normalize_sentence)
     else:
-        # val/test corpus
+        # val/test/submit corpus
         transform(corpus, 'context', replace_person)
         transform(corpus, 'context', lambda l: list(map(normalize_word, l)))
         transform(corpus, 'context', normalize_sentence)
@@ -314,13 +340,13 @@ def transform_corpus(corpus, dico, params, fmt):
         corpus: corpus to be transformed
         dico: a mapping from token to index
         params: experiment parameters
-        fmt: 'train'/'val'/'test'
+        fmt: 'train'/'val'/'test'/'submit'
 
     Returns:
         A transformed corpus
     '''
 
-    assert fmt in ['train', 'val', 'test'], (
+    assert fmt in ['train', 'val', 'test', 'submit'], (
         'Unexpected value %s for `fmt`' % fmt)
 
     logger = logging.getLogger('__main__')
@@ -345,13 +371,15 @@ def transform_corpus(corpus, dico, params, fmt):
         corpus['story'] = np.array(corpus['story'], dtype=np.int32)
         logger.info('Train corpus story shape ' + str(corpus['story'].shape))
     else:
-        # validation/test corpus
+        # validation/test/submission corpus
         transform(corpus, 'context', word2id)
         corpus['context'] = np.array(corpus['context'], dtype=np.int32)
-        logger.info('Validation/Test corpus context shape ' + str(corpus['context'].shape))
+        logger.info('%s corpus context shape %s' %
+                    (fmt, str(corpus['context'].shape)))
         transform(corpus, 'endings', word2id)
         corpus['endings'] = np.array(corpus['endings'], dtype=np.int32)
-        logger.info('Validation/Test corpus endings shape ' + str(corpus['endings'].shape))
+        logger.info('%s corpus endings shape %s' %
+                    (fmt, str(corpus['endings'].shape)))
 
     logger.info('Finished transforming corpus')
     save_obj(objname, corpus)
@@ -635,11 +663,12 @@ def batch_generator(corpus, params, fmt, negative_choices=None):
     Args:
         corpus: train/val corpus
         params: experiment parameters
-        fmt: 'train'/'val'/'test'
+        fmt: 'train'/'val'/'test'/'submit'
         negative_choices: set of negative endings
     '''
 
-    assert fmt in ['train', 'val', 'test'], 'Unexpected value %s for fmt' % fmt
+    assert fmt in ['train', 'val', 'test',
+                   'submit'], 'Unexpected value %s for fmt' % fmt
 
     if fmt == 'train': # train corpus
         X = corpus['story']
@@ -679,7 +708,7 @@ def batch_generator(corpus, params, fmt, negative_choices=None):
             labels[:, 0] = 1 # first column is correct ending
 
             yield context, endings, labels
-    else: # validation/test corpus
+    elif fmt in ['val', 'test']: # validation/test corpus
         X = corpus['context']
         n = X.shape[0]
         n_batch = (n-1)//params.batch_size + 1
@@ -714,6 +743,10 @@ def batch_generator(corpus, params, fmt, negative_choices=None):
             labels = np.zeros((n, endings.shape[1]), np.int32)
             labels[np.arange(n), answer] = 1
             yield context, endings, labels
+    else: # submit corpus
+        context = corpus['context'][:, :, 1:] # remove BOS
+        endings = corpus['endings'][:, :, 1:] # remove BOS
+        yield context, endings
 
 
 def train_step(sess, batch, model):
@@ -775,7 +808,33 @@ def val_step(sess, batch, model):
 
     return prediction
 
-    
+
+def pred_step(sess, batch, model):
+    '''Make a single prediction step.
+
+    Args:
+        sess: Tensorflow session
+        batch: training batch
+        model: cloze classifier
+
+    Returns:
+        prediction
+    '''
+
+    logger = logging.getLogger('__main__')
+
+    context, endings = batch
+    feed_dict = {
+        model.context: context,
+        model.endings: endings,
+        model.training: False
+    }
+    prefer = sess.run(model.prefer, feed_dict)
+
+    logger.info('Prediction with %d stories' % context.shape[0])
+    return prefer
+
+
 def main():
     '''Main function.'''
 
@@ -799,6 +858,10 @@ def main():
                         help='Path to evaluation corpus')
     parser.add_argument('--test_corpus', type=str, default='data/test.csv',
                         help='Path to test corpus')
+    parser.add_argument('--submit_corpus', type=str, default='data/submit.csv',
+                        help='Path to submission corpus')
+    parser.add_argument('--prediction', type=str, default=None,
+                        help='Path to prediction output file')
     parser.add_argument('--max_sentence_length', type=int, default=40,
                         help='Maximum sentence length to keep, default 40')
     parser.add_argument('--vocab_size', type=int, default=20000,
@@ -822,6 +885,10 @@ def main():
     parser.add_argument('--exp_path', type=str, default=None,
                         help='Experiment path')
     params = parser.parse_args()
+
+    # set random seeds
+    np.random.seed(SEED)
+    tf.set_random_seed(SEED)
 
     # parameter validation
     assert os.path.exists(params.train_corpus)
@@ -850,11 +917,13 @@ def main():
     train_corpus = load_corpus(params.train_corpus, params, 'train')
     val_corpus = load_corpus(params.val_corpus, params, 'val')
     test_corpus = load_corpus(params.test_corpus, params, 'test')
+    submit_corpus = load_corpus(params.submit_corpus, params, 'submit')
 
     # preprocess corpora
     train_corpus = preprocess_corpus(train_corpus, params, 'train')
     val_corpus = preprocess_corpus(val_corpus, params, 'val')
     test_corpus = preprocess_corpus(test_corpus, params, 'test')
+    submit_corpus = preprocess_corpus(submit_corpus, params, 'submit')
 
     # build dictionary
     dico = build_dictionary(train_corpus, params)
@@ -865,6 +934,7 @@ def main():
     train_corpus = transform_corpus(train_corpus, dico, params, 'train')
     val_corpus = transform_corpus(val_corpus, dico, params, 'val')
     test_corpus = transform_corpus(test_corpus, dico, params, 'test')
+    submit_corpus = transform_corpus(submit_corpus, dico, params, 'submit')
 
     # classifier
     logger.info('Building model')
@@ -906,6 +976,18 @@ def main():
             logger.info('Validation on test set')
             for batch in batch_generator(test_corpus, params, 'test'):
                 val_step(sess, batch, model)
+
+        # final prediction
+        for batch in batch_generator(submit_corpus, params, 'submit'):
+            predictions = pred_step(sess, batch, model)
+            predictions += 1
+
+        # output predictions
+        if params.prediction is not None:
+            logger.info('Writing prediction results to %s' % params.prediction)
+            with open(params.prediction, 'w') as f:
+                for i in predictions:
+                    f.write('%d\n' % i)
 
 
 if __name__ == '__main__':
